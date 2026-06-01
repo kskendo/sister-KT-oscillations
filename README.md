@@ -123,4 +123,4 @@ If you use this code, please cite:
 
 ## Contact
 
-Klea Skenderi — [your institutional email]
+Kristjana Skendo kristjana.skendo@unige.ch
