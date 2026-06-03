@@ -1,32 +1,38 @@
 """
-Sister Kinetochore Oscillations - Cross-Correlation Analysis
-=============================================================
+Sister Kinetochore Oscillations - Auto-Correlation Analysis
+============================================================
+Reads auto-correlation of kinetochore spindle-axis projections directly
+from KiT .mat files (sisterMotionCoupling/Inlier/autocorr/indcell/projectionsSis1).
+
+Auto-correlation starts at 1.0 at lag=0 by definition.
+The depth of the first trough reflects oscillation REGULARITY (not amplitude):
+a deeper trough = more regular/periodic oscillations.
+Period is estimated by damped cosine fit to the auto-correlation curve.
+
 Outputs:
-  1. sister_KT_oscillations.pdf / .png  - publication figure (Prism-style)
-  2. sister_KT_amplitude_prism.csv      - amplitude data ready for Prism
+  1. sister_KT_oscillations.pdf / .png  - publication figure
+  2. sister_KT_regularity_prism.csv     - regularity data ready for Prism
   3. sister_KT_period_prism.csv         - period data ready for Prism
 
-FILE NAMING: <condition>_<rep>_<anything>.fig
-USAGE:  py sister_KT_oscillations.py
+FILE NAMING: <condition>_<rep>_makiAnalysis__1.mat
+USAGE:  python sister_KT_oscillations.py
 """
 
 import os, re
 import h5py
 import numpy as np
 from scipy import stats
-from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 import matplotlib
-matplotlib.use('Agg')   # remove if you want an interactive window
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import csv
 
 # =============================================================================
 #  USER SETTINGS
 # =============================================================================
 
-DATA_DIR   = r"C:\Users\skendo\Desktop\sister-kt-oscillations"
+DATA_DIR  = r"C:\Users\skendo\Desktop\maki_oscillations"
 
 CONDITIONS = ["siCTRL", "siHAUS6", "siHURP", "siHAUS6siHURP"]
 
@@ -37,50 +43,57 @@ LABELS = {
     "siHAUS6siHURP": "siHAUS6+siHURP",
 }
 
-X_MIN, X_MAX = 0, 100    # x-axis display range (seconds)
+DT        = 7.5          # acquisition interval (seconds)
+N_LAGS    = 21           # number of lag points stored by KiT (0 to 20*DT)
+X_MIN     = 0            # display range start (seconds)
+X_MAX     = 100          # display range end (seconds)
 
-OUTPUT_PDF      = "sister_KT_oscillations.pdf"
-OUTPUT_PNG      = "sister_KT_oscillations.png"
-OUTPUT_AMP_CSV  = "sister_KT_amplitude_prism.csv"
-OUTPUT_PER_CSV  = "sister_KT_period_prism.csv"
+OUTPUT_PDF     = "sister_KT_oscillations.pdf"
+OUTPUT_PNG     = "sister_KT_oscillations.png"
+OUTPUT_REG_CSV = "sister_KT_regularity_prism.csv"
+OUTPUT_PER_CSV = "sister_KT_period_prism.csv"
 
 # =============================================================================
 #  DATA LOADING
 # =============================================================================
 
-common_x = np.linspace(-140, 140, 41)
-mask     = (common_x >= X_MIN) & (common_x <= X_MAX)
-xp       = common_x[mask]
+lags = np.arange(N_LAGS) * DT          # [0, 7.5, 15, ..., 150] seconds
+mask = (lags >= X_MIN) & (lags <= X_MAX)
+xp   = lags[mask]
 
 
-def extract_curves(filepath):
-    """Return all 41-point cross-correlation curves from one .fig file."""
-    curves = []
-    with h5py.File(filepath, 'r') as f:
-        refs = f.get('#refs#')
-        if refs is None:
-            return curves
-        for key in refs:
-            grp = refs[key]
-            if not isinstance(grp, h5py.Group):
-                continue
-            if 'XData' not in grp or 'YData' not in grp:
-                continue
-            x = grp['XData'][:].flatten()
-            y = grp['YData'][:].flatten()
-            if len(y) == 41 and not np.all(np.isnan(y)):
-                curves.append((x, y))
-    return curves
-
-
-def get_all_pairs(condition, data_dir):
+def load_autocorr(filepath):
     """
-    Extract every individual KT-pair curve for a condition.
-    Returns (amplitudes, periods) as 1-D arrays.
-    Also returns per-replicate means for plotting.
+    Load per-cell auto-correlation of spindle-axis kinetochore projections
+    from one KiT .mat file.
+
+    Returns list of 1-D arrays (one per valid cell), each of length N_LAGS.
+    Each array starts at 1.0 (lag=0) and reflects the regularity of
+    kinetochore oscillations: deeper first trough = more regular oscillations.
+    """
+    key = 'analysisStruct/sisterMotionCoupling/Inlier/autocorr/indcell/projectionsSis1'
+    with h5py.File(filepath, 'r') as f:
+        ac = f[key][:]          # shape (n_cells, 2, N_LAGS); row 0 = mean per cell
+    valid = []
+    for i in range(ac.shape[0]):
+        row = ac[i, 0, :]
+        if not np.isnan(row[0]):
+            valid.append(row)
+    return valid
+
+
+def get_all_data(condition, data_dir):
+    """
+    Load all replicates for one condition.
+
+    Returns:
+      regularities  - 1-D array of per-cell regularity values
+                      (peak - trough of auto-correlation curve in display window)
+      periods       - 1-D array of per-cell oscillation periods (s) from damped cosine fit
+      rep_means     - array (n_reps, n_displayed_lags) of replicate-mean curves
     """
     pattern = re.compile(
-        rf'^{re.escape(condition)}_\d+_.*\.fig$', re.IGNORECASE
+        rf'^{re.escape(condition)}_\d+_.*\.mat$', re.IGNORECASE
     )
     files = sorted([
         os.path.join(data_dir, f)
@@ -89,39 +102,41 @@ def get_all_pairs(condition, data_dir):
     ])
     if not files:
         raise FileNotFoundError(
-            f"No files found for '{condition}' in {data_dir}.\n"
-            f"Expected: {condition}_1_<anything>.fig"
+            f"No .mat files found for '{condition}' in {data_dir}.\n"
+            f"Expected pattern: {condition}_1_makiAnalysis__1.mat"
         )
 
-    all_amps    = []
+    all_reg     = []
     all_periods = []
-    rep_means   = []   # for the cross-correlation plot
+    rep_means   = []
 
     for fp in files:
-        rep_curves = []
-        for x0, y0 in extract_curves(fp):
-            yi = interp1d(x0, y0, bounds_error=False,
-                          fill_value=np.nan)(common_x)
-            yp = yi[mask]
-            if np.any(np.isnan(yp)):
-                continue
+        cells = load_autocorr(fp)
+        rep_cell_curves = []
 
-            rep_curves.append(yp)
+        for ac_full in cells:
+            # crop to display window
+            yp = ac_full[mask]
 
-            # --- amplitude ---
-            idx0  = np.argmin(np.abs(xp))
-            tmask = (xp >= 20) & (xp <= 60)
-            amp   = yp[idx0] - np.nanmin(yp[tmask])
-            all_amps.append(amp)
+            # --- regularity: peak (lag=0, always 1.0) minus first trough ---
+            # search for first trough between 15s and 60s
+            trough_mask = (xp >= 15) & (xp <= 60)
+            if trough_mask.any():
+                trough_val = np.nanmin(yp[trough_mask])
+            else:
+                trough_val = np.nanmin(yp)
+            regularity = yp[0] - trough_val    # peak - trough; larger = more regular
+            all_reg.append(regularity)
 
-            # --- period (damped cosine) ---
+            # --- period: damped cosine fit to auto-correlation curve ---
             try:
-                def dc(t, A, tau, T, phi, c):
-                    return A * np.exp(-t / tau) * np.cos(2*np.pi*t/T + phi) + c
+                def damped_cosine(t, A, tau, T, phi, c):
+                    return A * np.exp(-t / tau) * np.cos(2 * np.pi * t / T + phi) + c
+
                 popt, _ = curve_fit(
-                    dc, xp, yp,
-                    p0     = [0.3, 50, 30, 0, 0.1],
-                    bounds = ([0, 5, 5, -np.pi, -1],
+                    damped_cosine, xp, yp,
+                    p0     = [0.3, 50, 60, 0, 0.0],
+                    bounds = ([0,  5,   5, -np.pi, -1],
                               [1, 500, 200,  np.pi,  1]),
                     maxfev = 5000
                 )
@@ -129,19 +144,21 @@ def get_all_pairs(condition, data_dir):
             except Exception:
                 pass
 
-        if rep_curves:
-            rep_means.append(np.nanmean(rep_curves, axis=0))
+            rep_cell_curves.append(yp)
+
+        if rep_cell_curves:
+            rep_means.append(np.nanmean(rep_cell_curves, axis=0))
 
     print(f"  {condition}: {len(files)} replicates, "
-          f"{len(all_amps)} KT pairs")
+          f"{len(all_reg)} cells, {len(all_periods)} period fits")
 
-    return (np.array(all_amps),
+    return (np.array(all_reg),
             np.array(all_periods),
-            np.array(rep_means))   # shape (n_reps, n_timepoints_displayed)
+            np.array(rep_means))      # shape (n_reps, n_displayed_lags)
 
 
 # =============================================================================
-#  STATISTICS  (individual KT pairs, Kruskal-Wallis + Dunn-Bonferroni)
+#  STATISTICS  (per-cell values, Kruskal-Wallis + Dunn-Bonferroni)
 # =============================================================================
 
 def p_stars(p):
@@ -152,13 +169,8 @@ def p_stars(p):
 
 
 def run_statistics(metric_dict, metric_name):
-    """
-    Shapiro-Wilk on first 50 of each group to choose test.
-    Returns dict: condition -> adjusted p-value vs siCTRL
-    """
     groups = [metric_dict[c] for c in CONDITIONS]
 
-    # normality check (Shapiro limited to n < 5000)
     all_normal = all(
         stats.shapiro(g[:50]).pvalue > 0.05
         for g in groups if len(g) >= 3
@@ -173,7 +185,7 @@ def run_statistics(metric_dict, metric_name):
         k         = len(groups)
         ms_w      = sum(np.sum((g - g.mean())**2)
                         for g in groups) / (n_tot - k)
-        ctrl      = groups[0]
+        ctrl = groups[0]
         for i, cond in enumerate(CONDITIONS[1:]):
             g2   = groups[i + 1]
             diff = ctrl.mean() - g2.mean()
@@ -216,29 +228,19 @@ def run_statistics(metric_dict, metric_name):
 # =============================================================================
 
 def save_prism_csv(metric_dict, filepath):
-    """
-    Saves data in Prism-friendly format:
-    One column per condition, one row per KT pair (unequal lengths OK in Prism).
-    """
     cols   = [metric_dict[c] for c in CONDITIONS]
     n_rows = max(len(c) for c in cols)
-
     with open(filepath, 'w', newline='') as f:
         writer = csv.writer(f)
-        # header
         writer.writerow([LABELS[c] for c in CONDITIONS])
-        # data rows
         for i in range(n_rows):
-            row = []
-            for col in cols:
-                row.append(col[i] if i < len(col) else '')
+            row = [col[i] if i < len(col) else '' for col in cols]
             writer.writerow(row)
-
     print(f"  Saved: {filepath}")
 
 
 # =============================================================================
-#  FIGURE  (Prism-style: box + scatter, black outlines, grey boxes)
+#  FIGURE
 # =============================================================================
 
 def mean_ci95(arr):
@@ -249,25 +251,21 @@ def mean_ci95(arr):
 
 
 def draw_boxplot(ax, position, values, color='#C0C0C0'):
-    """Draw a Prism-style box (IQR box, median line, whiskers, no fliers)."""
     values = values[~np.isnan(values)]
     if len(values) == 0:
         return
     q1, med, q3 = np.percentile(values, [25, 50, 75])
-    iqr          = q3 - q1
-    lo_whisk     = max(values.min(), q1 - 1.5 * iqr)
-    hi_whisk     = min(values.max(), q3 + 1.5 * iqr)
-    bw           = 0.35   # box half-width
+    iqr      = q3 - q1
+    lo_whisk = max(values.min(), q1 - 1.5 * iqr)
+    hi_whisk = min(values.max(), q3 + 1.5 * iqr)
+    bw       = 0.35
 
-    # box
     rect = plt.Rectangle((position - bw, q1), 2*bw, iqr,
                           facecolor=color, edgecolor='black',
                           linewidth=1.2, zorder=2)
     ax.add_patch(rect)
-    # median
     ax.plot([position - bw, position + bw], [med, med],
             color='black', lw=1.5, zorder=3)
-    # whiskers
     ax.plot([position, position], [q3, hi_whisk],
             color='black', lw=1.0, zorder=2)
     ax.plot([position, position], [q1, lo_whisk],
@@ -279,28 +277,29 @@ def draw_boxplot(ax, position, values, color='#C0C0C0'):
 
 
 def add_brackets(ax, x1, x2, y, label, gap=0.02):
-    """Draw a significance bracket between positions x1 and x2."""
     ax.plot([x1, x1, x2, x2], [y, y + gap, y + gap, y],
             color='black', lw=1.0)
-    ax.text((x1 + x2) / 2, y + gap + 0.01 * (ax.get_ylim()[1] - ax.get_ylim()[0]),
+    ax.text((x1 + x2) / 2,
+            y + gap + 0.01 * (ax.get_ylim()[1] - ax.get_ylim()[0]),
             label, ha='center', va='bottom', fontsize=9)
 
 
-def make_figure(rep_means_dict, amps, pers, ph_amp, ph_per):
+def make_figure(rep_means_dict, regs, pers, ph_reg, ph_per):
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle("Sister-Kinetochore Oscillations",
                  fontsize=14, fontweight='bold', y=1.01)
 
-    # ── Panel A: cross-correlation (replicate means ± 95 CI) ─────────────────
-    ax = axes[0]
     COLORS = {
         "siCTRL":        "#808080",
         "siHAUS6":       "#FFB3C1",
         "siHURP":        "#4CAF50",
         "siHAUS6siHURP": "#4A0072",
     }
+
+    # ── Panel A: auto-correlation (replicate means ± 95% CI) ─────────────────
+    ax = axes[0]
     for c in CONDITIONS:
-        rm = rep_means_dict[c]   # (n_reps, n_timepoints)
+        rm = rep_means_dict[c]
         if rm.shape[0] == 0:
             continue
         m, ci = mean_ci95(rm)
@@ -310,52 +309,51 @@ def make_figure(rep_means_dict, amps, pers, ph_amp, ph_per):
 
     ax.axhline(0, color='k', lw=0.6, ls='--', alpha=0.4)
     ax.set_xlim(X_MIN, X_MAX)
+    ax.set_ylim(-0.6, 1.05)
     ax.set_xlabel("Time lag (s)", fontsize=9)
-    ax.set_ylabel("Autocorrelation of KT-sister motion", fontsize=9)
-    ax.set_title("A  Cross-correlation\n(replicate means ± 95% CI)",
+    ax.set_ylabel("Auto-correlation of KT motion", fontsize=9)
+    ax.set_title("A  Auto-correlation\n(replicate means ± 95% CI)",
                  fontsize=10, loc='left')
     ax.spines[['top', 'right']].set_visible(False)
     ax.legend(fontsize=7.5, frameon=False)
 
-    # ── Panel B: amplitude (Prism-style box + scatter) ────────────────────────
+    # ── Panel B: oscillation regularity (box + scatter) ───────────────────────
     ax = axes[1]
     positions = list(range(len(CONDITIONS)))
-    all_vals  = np.concatenate([amps[c] for c in CONDITIONS])
+    all_vals  = np.concatenate([regs[c] for c in CONDITIONS])
     y_max     = np.nanmax(all_vals)
     y_min     = np.nanmin(all_vals)
     pad       = (y_max - y_min) * 0.05
 
     for i, c in enumerate(CONDITIONS):
-        vals = amps[c]
+        vals = regs[c]
         draw_boxplot(ax, i, vals, color='#C0C0C0')
         jitter = (np.random.rand(len(vals)) - 0.5) * 0.25
         ax.scatter(np.full(len(vals), i) + jitter, vals,
                    color='#404040', s=20, zorder=4,
                    edgecolors='black', linewidths=0.3, alpha=0.7)
 
-    # significance brackets
     bracket_base = y_max + pad
     step         = (y_max - y_min) * 0.08
     for i, cond in enumerate(CONDITIONS[1:]):
-        p  = ph_amp[cond]
+        p  = ph_reg[cond]
         yb = bracket_base + i * step
-        add_brackets(ax, 0, i + 1, yb, p_stars(p),
-                     gap=step * 0.15)
+        add_brackets(ax, 0, i + 1, yb, p_stars(p), gap=step * 0.15)
 
     ax.set_xticks(positions)
     ax.set_xticklabels([LABELS[c] for c in CONDITIONS],
                        fontsize=8, rotation=20, ha='right')
-    ax.set_ylabel("Oscillation amplitude\n(peak − trough correlation)", fontsize=9)
-    ax.set_title("B  Amplitude", fontsize=10, loc='left')
+    ax.set_ylabel("Oscillation regularity\n(peak \u2212 trough of auto-correlation)",
+                  fontsize=9)
+    ax.set_title("B  Oscillation regularity", fontsize=10, loc='left')
     ax.set_xlim(-0.6, len(CONDITIONS) - 0.4)
     ax.set_ylim(y_min - pad,
                 bracket_base + len(CONDITIONS) * step + step)
     ax.spines[['top', 'right']].set_visible(False)
 
-    # ── Panel C: period (Prism-style box + scatter) ───────────────────────────
+    # ── Panel C: oscillation period (box + scatter) ───────────────────────────
     ax = axes[2]
-    all_per   = np.concatenate([pers[c] for c in CONDITIONS
-                                 if len(pers[c]) > 0])
+    all_per   = np.concatenate([pers[c] for c in CONDITIONS if len(pers[c]) > 0])
     y_max_per = np.nanmax(all_per)
     y_min_per = np.nanmin(all_per)
     pad_per   = (y_max_per - y_min_per) * 0.05
@@ -375,14 +373,13 @@ def make_figure(rep_means_dict, amps, pers, ph_amp, ph_per):
     for i, cond in enumerate(CONDITIONS[1:]):
         p  = ph_per[cond]
         yb = bracket_base_per + i * step_per
-        add_brackets(ax, 0, i + 1, yb, p_stars(p),
-                     gap=step_per * 0.15)
+        add_brackets(ax, 0, i + 1, yb, p_stars(p), gap=step_per * 0.15)
 
     ax.set_xticks(range(len(CONDITIONS)))
     ax.set_xticklabels([LABELS[c] for c in CONDITIONS],
                        fontsize=8, rotation=20, ha='right')
     ax.set_ylabel("Oscillation period (s)", fontsize=9)
-    ax.set_title("C  Period (damped cosine fit)", fontsize=10, loc='left')
+    ax.set_title("C  Oscillation period (damped cosine fit)", fontsize=10, loc='left')
     ax.set_xlim(-0.6, len(CONDITIONS) - 0.4)
     ax.set_ylim(y_min_per - pad_per,
                 bracket_base_per + len(CONDITIONS) * step_per + step_per)
@@ -405,27 +402,27 @@ def make_figure(rep_means_dict, amps, pers, ph_amp, ph_per):
 
 if __name__ == "__main__":
 
-    print("Loading data and extracting KT pairs...")
-    amps          = {}
-    pers          = {}
+    print("Loading auto-correlation data from .mat files...")
+    regs           = {}
+    pers           = {}
     rep_means_dict = {}
 
     for c in CONDITIONS:
-        a, p, rm        = get_all_pairs(c, DATA_DIR)
-        amps[c]         = a
+        r, p, rm        = get_all_data(c, DATA_DIR)
+        regs[c]         = r
         pers[c]         = p
         rep_means_dict[c] = rm
 
-    print("\n--- Statistics (individual KT pairs) ---")
-    ph_amp = run_statistics(amps, "Amplitude")
-    ph_per = run_statistics(pers, "Period")
+    print("\n--- Statistics (per-cell values) ---")
+    ph_reg = run_statistics(regs, "Oscillation regularity")
+    ph_per = run_statistics(pers, "Oscillation period")
 
     print("\nSaving Prism CSV files...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    save_prism_csv(amps, os.path.join(script_dir, OUTPUT_AMP_CSV))
+    save_prism_csv(regs, os.path.join(script_dir, OUTPUT_REG_CSV))
     save_prism_csv(pers, os.path.join(script_dir, OUTPUT_PER_CSV))
 
     print("\nGenerating figure...")
-    make_figure(rep_means_dict, amps, pers, ph_amp, ph_per)
+    make_figure(rep_means_dict, regs, pers, ph_reg, ph_per)
 
     print("\nAll done!")
