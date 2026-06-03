@@ -125,7 +125,7 @@ def get_all_data(condition, data_dir):
                 trough_val = np.nanmin(yp[trough_mask])
             else:
                 trough_val = np.nanmin(yp)
-            regularity = yp[0] - trough_val    # peak - trough; larger = more regular
+            regularity = (yp[0] - trough_val) / 2.0    # normalized [0,1]: 1.0 = perfectly periodic
             all_reg.append(regularity)
 
             # --- period: damped cosine fit to auto-correlation curve ---
@@ -343,7 +343,7 @@ def make_figure(rep_means_dict, regs, pers, ph_reg, ph_per):
     ax.set_xticks(positions)
     ax.set_xticklabels([LABELS[c] for c in CONDITIONS],
                        fontsize=8, rotation=20, ha='right')
-    ax.set_ylabel("Oscillation regularity\n(peak \u2212 trough of auto-correlation)",
+    ax.set_ylabel("Oscillation regularity\n(normalized, 0\u20131)",
                   fontsize=9)
     ax.set_title("B  Oscillation regularity", fontsize=10, loc='left')
     ax.set_xlim(-0.6, len(CONDITIONS) - 0.4)
